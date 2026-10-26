@@ -1,6 +1,6 @@
 --  
 --   MIDI MONITOR
---   0.6.2 - @okyeron
+--   0.6.3 - @okyeron (modified by metra.vestlud)
 --
 --
 --   E1 - select MIDI device
@@ -8,6 +8,13 @@
 --
 --   K2 - toggle unmute/mute internal synth
 --   K3 - clear screen / buffer
+--
+--   0.6.3 changes:
+--   - E1 now steps through ALL norns MIDI ports (not only the first 4)
+--   - empty ("none") ports are skipped, see skip_empty_ports below
+--   - long device name on the main screen scrolls like a ticker
+--   - device name in PARAMS menu is shortened so it doesn't
+--     overlap the parameter title
 --
 
 engine.name = 'PolyPerc'
@@ -31,6 +38,17 @@ local mute = true
 local midi_buffer = {}
 local midi_buffer_len = 256
 local buff_start = 1
+
+-- device selection / title settings
+local skip_empty_ports = true  -- true: E1 skips ports with no device ("none")
+                               -- false: E1 steps through all 16 ports
+local title_max_w = 86         -- px available for the title (bpm label starts at x=90)
+local param_label_len = 16     -- max chars of device name in the PARAMS menu
+local marquee_time = 0.2       -- seconds per one step of the ticker
+local marquee_hold = 6         -- steps to wait before the ticker starts moving
+local marquee_pos = 0
+local marquee_active = false
+local marquee_metro
 
 -- display grid setup
 local line_height = 8
@@ -70,7 +88,7 @@ function init()
  
   -- setup params
   
-  params:add{type = "option", id = "midi_device", name = "MIDI-device", options = mdevs , default = 1,
+  params:add{type = "option", id = "midi_device", name = "MIDI", options = param_option_names(), default = 1,
     action = function(value)
       midi_device.event = nil
       --grid.cleanup()
@@ -80,14 +98,14 @@ function init()
 
       mdevs = {}
       get_midi_names()
-      params.params[1].options = mdevs
-      --tab.print(params.params[1].options)
+      refresh_param_options()
       devicepos = value
+      reset_marquee()
       if clocking then 
         clock.cancel(blink_id)
         clocking = false
       end
-      print ("midi ".. devicepos .." selected: " .. mdevs[devicepos])
+      print ("midi ".. devicepos .." selected: " .. (mdevs[devicepos] or "none"))
       
     end}
 
@@ -100,6 +118,9 @@ function init()
   --print(tempo)
   --print(tempo2)
 
+  -- ticker for long device names
+  marquee_metro = metro.init(marquee_tick, marquee_time, -1)
+  marquee_metro:start()
   
   -- Render Style
   screen.level(15)
@@ -109,20 +130,44 @@ function init()
 end
 -- END INIT
 
+function cleanup()
+  if marquee_metro then
+    marquee_metro:stop()
+  end
+end
+
 
 function get_midi_names()
-  -- Get a list of grid devices
+  -- Get a list of midi devices
   for id,device in pairs(midi.vports) do
     mdevs[id] = device.name
   end
 end
 
 function print_midi_names()
-  -- Get a list of grid devices
+  -- Get a list of midi devices
   print ("MIDI Devices:")
   for id,device in pairs(midi.vports) do
     mdevs[id] = device.name
     print(id, mdevs[id])
+  end
+end
+
+-- shortened names for the PARAMS menu: "3:Launchp..t 2"
+function param_option_names()
+  local names = {}
+  for id = 1, #midi.vports do
+    local prefix = id .. ":"
+    local name = midi.vports[id].name or "none"
+    names[id] = prefix .. short_name(name, param_label_len - #prefix)
+  end
+  return names
+end
+
+function refresh_param_options()
+  local p = params.params[params.lookup["midi_device"]]
+  if p then
+    p.options = param_option_names()
   end
 end
 
@@ -281,11 +326,10 @@ end
 
 function enc(id,delta)
   if id == 1 then
-    --print(params:get("midi_device"))
-    params:set("midi_device", util.clamp(devicepos+delta, 1,4))
-    if clocking then
-      clock.cancel(blink_id)
-      clocking = false
+    local new_pos = next_port(devicepos, delta > 0 and 1 or -1)
+    if new_pos ~= devicepos then
+      -- the param action reconnects the device and stops the clock blinker
+      params:set("midi_device", new_pos)
     end
   end
   if id == 2 then
@@ -295,6 +339,54 @@ function enc(id,delta)
   end
   
   redraw()
+end
+
+-- next selectable MIDI port in the given direction (no wrap-around)
+function next_port(from, dir)
+  local id = from + dir
+  while id >= 1 and id <= #midi.vports do
+    local name = midi.vports[id].name
+    if (not skip_empty_ports) or (name and name ~= "none") then
+      return id
+    end
+    id = id + dir
+  end
+  return from
+end
+
+--
+-- Ticker (running line) for the device name
+--
+
+function reset_marquee()
+  marquee_pos = 0
+end
+
+function marquee_tick()
+  if marquee_active then
+    marquee_pos = marquee_pos + 1
+    redraw()
+  end
+end
+
+-- returns the part of txt that fits into max_w px, shifted by pos
+function marquee_text(txt, max_w, pos)
+  if screen.text_extents(txt) <= max_w then
+    marquee_active = false
+    return txt
+  end
+  marquee_active = true
+
+  local cycle = txt .. "   "
+  local doubled = cycle .. cycle
+  local start = (math.max(0, pos - marquee_hold) % #cycle) + 1
+  local out = ""
+  for i = start, #doubled do
+    local nxt = out .. string.sub(doubled, i, i)
+    if screen.text_extents(nxt) > max_w then break end
+    out = nxt
+  end
+  return out
 end
 
 --
@@ -342,6 +434,20 @@ function draw_event()
   end 
 end
 
+function draw_device_title()
+  local port = midi.vports[devicepos]
+  local name = (port and port.name) or "none"
+  local prefix = devicepos .. ":"
+
+  screen.level(15)
+  screen.move(0, 7)
+  screen.text(prefix)
+
+  local x = screen.text_extents(prefix) + 3
+  screen.move(x, 7)
+  screen.text(marquee_text(name, title_max_w - x, marquee_pos))
+end
+
 function redraw()
   tempo_disp = util.round (clock.get_tempo(), 1)
 
@@ -380,9 +486,7 @@ function redraw()
   --screen.line (116, 64)
   --screen.stroke()
 
-  screen.level(15)
-  screen.move(0, 7)
-  screen.text(devicepos .. ": ".. truncate_txt(mdevs[devicepos], 19))
+  draw_device_title()
 
   screen.update()
 end
@@ -391,18 +495,16 @@ end
 -- Utils
 --
 
-function truncate_txt(txt, size)
-  if string.len(txt) > size then
-    s1 = string.sub(txt, 1, 9) .. "..."
-    s2 = string.sub(txt, string.len(txt) - 5, string.len(txt))
-    s = s1..s2
-  else 
-    s = txt
+-- shorten a long name, keeping the beginning and the end: "Launchp..t 2"
+function short_name(txt, size)
+  if #txt <= size then
+    return txt
   end
-  return s
+  local tail = 5
+  local head = math.max(1, size - tail - 2)
+  return string.sub(txt, 1, head) .. ".." .. string.sub(txt, -tail)
 end
 
 function note_to_hz(note)
   return (440 / 32) * (2 ^ ((note - 9) / 12))
 end
-
